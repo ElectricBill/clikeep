@@ -30,7 +30,7 @@ Time filter specifications are combinations of ''{before|after} TIME'' as compar
 ##### Operations
 The operations that may be applied are:
 
-Options to modidy notes:
+Options to modify notes:
 
 - add label(s) (--tag)
 - remove label(s) (--untag)
