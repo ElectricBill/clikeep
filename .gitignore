@@ -1,0 +1,16 @@
+*~
+*#
+elpa
+session.*
+.directory
+cfg/dns/zones/marker
+#<AutoIgnore>
+colprint
+#<AutoIgnore/>
+nohup.out
+xtenv.out
+*.pyc
+pgramps
+token.pickle
+credentials.json
+__pycache__

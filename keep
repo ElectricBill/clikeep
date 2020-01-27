@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import configparser
+import pickle
+import gkeepapi
+from pathlib import Path
+import keyring
+import argparse
+import pdb
+cNames = set([str(e).replace('ColorValue.','').lower()
+              for e in gkeepapi.node.ColorValue])
+# There is also:
+# NodeType
+# BlobType
+# CategoryValue - used somehow with colors in Chrome
+catNames = set([str(e).replace('CategoryValue.','').lower()
+              for e in gkeepapi.node.CategoryValue])
+# print("Categorys:",catNames)
+# SuggestValue
+# NewListItemPlacementValue
+# GraveyardStateValue
+# CheckedListItemsPolicyValue
+# RoleValue
+# ShareRequestValue
+
+#print("Colors:",cNames)
+#sys.exit(0)
+
+verbosity = 10
+def out (s,g=10):
+    global verbosity
+    if verbosity >= g:
+        print(s)
+        
+def summary ():
+    allNotes = keep.all()
+    nk = len(allNotes)
+    out(f"There are {nk} note nodes.")
+
+def eList (node,flags,cs,labels):
+    out('Node ==================================================')
+#   out('Parent:',node.parent)
+    ntp = node.type
+#   out("Node type:"+str(ntp))
+    out('Flags:'+' '.join(flags))
+    out('color: '+str(cs))
+    out('labels:'+', '.join(labels))
+    #out('UTC times:')
+    for ta in ['created','edited','updated','trashed','deleted']:
+        tv = getattr(node.timestamps,ta,0)
+        if tv:
+            ts = tv.timestamp()
+            tzi = tv.tzinfo
+            #out('tzi',tzi) # always None, why? -because assumes UTC
+            if ts > 86399:
+                #pd = dp.parse(tv)
+                out(ta+":"+str(tv)+f'({ts}) UTC')
+            #else:
+            #   out(ta+" is ZERO")
+        #else:
+        #   out(ta+" is NOT SET")
+    if len(node.annotations) > 0:
+        for a in node.annotations.all():
+            out('annotation: '+str(a))
+            if isinstance(a,gkeepapi.node.Category):
+                out("Category:"+str(a.category))
+            elif isinstance(a,gkeepapi.node.WebLink):
+                out("  Title: "+a.title)
+                out("  url:        "+a.url)
+                out("  provenance: "+a.provenance_url)
+                out("  image:      "+str(a.image_url))
+                out("  description:"+a.description)
+    if len(node.collaborators) > 0:
+        out('collaborators:'+
+              ', '.join([l for l in node.collaborators.all()]))
+    if node.blobs:
+        out('blobs:'+str(node.blobs))
+
+    out('Title:'+node.title)
+    for tl in node.text.split('\n'):
+        out('>'+tl,g=20)
+    out('')
+    #print('RAW -------------')
+    #raw = node.save()
+    #print(raw)
+    #print()
+    #node.append(keep.createNote('Child 2', 'Child text 2'))
+    #print("--- Node type:",node.type)
+    #print(node.children)
+    #for ob in node.children:
+    #   if isinstance(ob,gkeepapi.node.Note):
+    #       print(f"Note v{ob.version} with text:",ob.text)
+    #   elif isinstance(ob,gkeepapi.node.ListItem):
+    #       print(f"ListItem v{ob.version} with checked:",ob.checked,ob.text)
+    #   else:
+    #       print("Just a",type(ob))
+            
+def parseTime (tspec):
+    import dateparser as dp
+    spec = {}
+    relation = 'after' # default
+    for tok in tspec:
+        #print(tok)
+        if tok in [ 'b','before' ]: relation = 'before'
+        elif tok in ['a','after' ]: relation = 'after'
+        else:
+            pt = dp.parse(tok)
+            if pt:
+                if relation in spec:
+                    print(f"ERROR: duplicate time relation: {relation}")
+                    return None
+                else:
+                    spec[relation] = pt.timestamp()
+    if not len(spec.keys()):
+        print(f'ERROR: no times extracted from {tspec}')
+        return None
+    #print("parseTime result:",spec)
+    return spec
+    
+def select (matchp=None,rematchp=None,
+            labelsp=None,
+            colorsp=None,
+            addTagsp=None,
+            delTagsp=None,
+            pinp=None,
+            newColor=None,
+            timesp={},
+            pinnedp=(None,None),
+            trashedp=False,
+            archivedp=False,
+            revivep=False,
+            archivep=False,
+            trashp=False,
+            execp=None,
+            extractp=None,
+            eAction=eList):
+    import datetime
+    import re
+    global keep
+    oops = False
+
+    if (revivep and archivep) or (revivep and trashp) or (archivep and trashp):
+        print("--archive, --trash and --revive are mutually exclusive actions")
+        oops = True
+        
+    # Selection by pinning
+    xpin,ipin = pinnedp
+    #print("PP:",xpin,ipin)
+    passpp = None
+    if xpin: # exclude pinned
+        if ipin:
+            print("Cannot include and exclude pinned")
+            oops = True
+        else:
+            passpp = False
+    elif ipin:
+        passpp = True
+    #print("passpp",passpp)
+
+    # Action by pinning:
+    apin,aunpin = pinp
+    #print("Action PP:",apin,aunpin)
+    passapp = None
+    if apin: # pin notes
+        if aunpin:
+            print("Cannot specify pin and unpin together")
+            oops = True
+        else:
+            passapp = True
+    elif aunpin:
+        passapp = False
+    #print("passapp",passapp)
+
+    # Actors prep
+    untags = None
+    if delTagsp is not None:
+        print("Removing labels (untagging):",' '.join(delTagsp))
+        untags = []
+        for dt in delTagsp:
+            rlabel = keep.findLabel(dt,create=False)
+            if rlabel: untags.append(rlabel)
+            else:
+                print(f'Label for untag "{dt}" is undefined')
+                oops = True
+
+    tags = None
+    if addTagsp:
+        print("Adding labels (tagging):",' '.join(addTagsp))
+        tags = []
+        for dt in addTagsp:
+            rlabel = keep.findLabel(dt,create=False)
+            if not rlabel:
+                print(f"WARN: Label {dt} will be created")
+                rlabel = keep.findLabel(dt,create=True)
+            tags.append(rlabel)
+
+    setColor = None
+    if newColor:
+        setColor = getattr(gkeepapi.node.ColorValue,newColor,None)
+        if setColor:
+            print(f'New color will be: {setColor} from {newColor}')
+        else:
+            print(f'Undefined color: {newColor}')
+            print('Valid colors are:\n ',
+                  ' '.join([c.name for c in list(gkeepapi.node.ColorValue)]))
+            oops = True
+            
+    # Selectors prep            
+    scolors = None # selected colors - default to any color
+    if colorsp != None:
+        print("Colors:",' '.join(colorsp))
+        # Turn color names to colors...
+        scolors = [] # will return nothing
+        cvs = dict([(c.value,c) for c in list(gkeepapi.node.ColorValue)])
+        #print(cvs)
+        for c in colorsp:
+            if c.upper() in cvs:
+                scolors.append(cvs[c.upper()])
+            else:
+                print(f'Color for "{c}" is undefined in {cvs.keys()}')
+                oops = True
+        if len(scolors) == 0: scolors = None
+        # we constructed a list of enum values, e.g.:
+        #scolors = [ gkeepapi.node.ColorValue.Blue ]
+
+    slabels = None # selected labels - default to all notes, labelled or not
+    if labelsp != None:
+        print("Selection labels:",' '.join(labelsp))
+        # Turn label names to labels...
+        slabels = [] # will return only notes with no labels
+        for ln in labelsp:
+            l = keep.findLabel(ln,create=False)
+            if l: slabels.append(l)
+            else:
+                print(f'Label "{ln}" is undefined')
+                oops = True
+    if matchp:
+        out("Match:"+matchp)
+        if rematchp:
+            print("--match and --re are mutually exclusive options")
+            oops = True
+    else:
+        if rematchp:
+            try:
+                matchp = re.compile(rematchp)
+            except Exception as e:
+                print(f'Regular expression problem: {e}')
+                oops = 1
+
+    # parse all time constraints supplied:
+    tconSet = {}
+    for tconk,tconv in timesp.items():
+        if tconv:
+            tconSet[tconk] = parseTime(tconv)
+            oops = oops or not tconSet[tconk]
+
+    #print('tconSet:',tconSet)
+    #sys.exit(0)
+    if extractp is not None: # Prepare extract directory
+        xpath = 'keepnotes'
+        if len(extractp) > 0:
+            xpath = extractp[0]
+        try:
+            fxpath = os.path.realpath(xpath)
+            print(f'Extract path: {fxpath}')
+            if os.path.exists(fxpath):
+                print(f'{fxpath} exists; it cannot be overlaid')
+                oops = True
+            else:
+                print(f'{fxpath} will be created')
+                os.makedirs(fxpath,exist_ok=True)
+                xlogf = open(os.path.join(fxpath,'extract.log'),'w')
+                xplaces = {}
+                lplaces = {}
+                for d in ['main','Archive','Trash','blobs','labels']:
+                    xplaces[d] = os.path.join(fxpath,d)
+                    os.makedirs(xplaces[d],exist_ok=True)
+        except Exception as e:
+            print('Extraction preparation failed: '+str(e))
+            oops = True
+            
+        #sys.exit(4)
+            
+    if oops:
+        sys.exit(9)
+
+    def dictifyAnno (o):
+        import copy
+        d = copy.copy(o).__dict__
+        #d['typerep'] = str(type(d['type']))
+        return d
+    
+    def dictifyBlob (blob):
+        import copy
+        d = copy.copy(blob.__dict__)
+        d['type'] = str(type(blob))
+        d['annorep'] = str(type(d['annotations']))
+        #d['anno'] = [dictifyAnno(a) for a in d['annotations'].all()]
+        d['anno'] = [dictifyAnno(a) for a in blob.annotations.all()]
+        d['blobraw'] = d['blob'].save(clean=False)
+        return d
+    
+    def dictifyChild (child):
+        import copy
+        d = copy.copy(child).__dict__
+        d['typerep'] = str(d['type'])
+        d['anno'] = [dictifyAnno(a) for a in child.annotations.all()]
+        
+        return d
+    
+    def dictifyNode (node,blobPath=None):
+        import copy
+        d = copy.copy(node.save(clean=False))
+        d['children'] = [dictifyChild(c) for c in node.children]
+        d['anno'] = [dictifyAnno(a) for a in node.annotations.all()]
+        d['blobs'] = [dictifyBlob(b) for b in node.blobs]
+        bk = 0
+        suffixes = { 'audio/3gpp':'3gpp', 'image/jpeg':'jpg',
+                     'image/png':'png'
+        }
+        for b in node.blobs:
+            blink = keep.getMediaLink(b)
+            #response = keep._session.request(url=blink)
+            response = keep._keep_api._send(method='GET',url=blink)
+            print("Get blob at:",blink)
+            if response.status_code != 200:
+                print(f'Response status_code: {response.status_code}')
+            else:
+                print(response.headers)
+                suffix = 'blob'
+                if 'Content-Type' in response.headers:
+                    mimeType = response.headers['Content-Type']
+                    if mimeType in suffixes:
+                        suffix = suffixes[mimeType]
+                #print(f"Res len: {len(response.content)}")
+                blobPath = os.path.join(xplaces['blobs'],
+                                        'blob.'+node.id+'.'+str(bk)+
+                                        '.'+suffix)
+                bf = open(blobPath,"wb")
+                bf.write(response.content)
+                bf.close()
+            d['blobs'][bk] = dictifyBlob(b)
+            bk += 1
+        d['text'] = node.text
+        return d
+
+    def extractOne (node):
+        import json
+        k = 'main'
+        if node.archived: k = 'Archive'
+        elif node.trashed: k = 'Trash'
+        tpath = xplaces[k]
+        npath = os.path.join(tpath,'note.'+node.id)
+        #npath = os.path.join(tpath,'note.'+node.sort)
+        wnf = open(npath,'w')
+        wnf.write(json.dumps(dictifyNode(node),
+                             default=lambda o: '<not serializable>'))
+        wnf.close()
+        xlogf.write(f"{node.title}\n")
+        for l in node.labels.all():
+            if l not in allLabels: allLabels[l.name] = []
+            allLabels[l.name].append(npath)
+
+    def linkExtracts (): # create label hard links for extracted note files
+        ldir = xplaces['labels']
+        #print(f'Label links live under: {ldir}')
+        for l,nList in allLabels.items():
+            #print(f"Link into {l}")
+            lpath = os.path.join(ldir,l)
+            os.makedirs(lpath,exist_ok=True)
+            for n in nList:
+                newlink = os.path.join(lpath,os.path.basename(n))
+                #print(f'Creating link to {n} from {newlink}')
+                #xlogf.write(f"Creating link to {n} from {newlink}\n")
+                os.link(n,newlink)
+
+    allLabels = {}
+    def tallyLabel (label):
+        if label not in labelSum: labelSum[label] = 0
+        #print('bump',label)
+        labelSum[label] += 1
+
+    def tallyLabels (labels):
+        #print('tallyLabels:',labels)
+        if len(labels) == 0:
+            tallyLabel('')
+            return
+        sl = sorted(labels)
+        tallyLabel('= '+('.'.join(sl))) # tally notes with only these labels
+        comboAll = 1 << (len(sl)) # mask combos
+        #print('comboAll:',comboAll)
+        for m in range(1,comboAll): # mask for each combo
+            #print("Mask:",m)
+            tagCombo = []
+            for i in range(0,len(sl)):
+                if (1 << i) & m != 0:
+                    tagCombo.append(sl[i])
+            cLabel = '+ '+'.'.join(tagCombo)
+            tallyLabel(cLabel) # combo of tags
+            #print('tallied:',cLabel)
+
+    flagk = {}
+    colorSum = {}
+    labelSum = {}
+    selectedk = 0
+    out("\nSELECTED NODES =========================================\n")
+    for node in keep.find(query=matchp,labels=slabels,
+                          colors=scolors,pinned=passpp,
+                          trashed=trashedp,archived=archivedp):
+
+        def timeFilter (node,tconSet): # returns True to reject (filter out)
+            # Find reason to reject among all time constraints
+            kx = { 'ctime':'created','etime':'edited','utime':'updated',
+                   'dtime':'deleted','ttime':'trashed', 'atime':'archived' }
+            #print('timeFilter')
+            for tck,tcp in tconSet.items():
+                tv = getattr(node.timestamps,kx[tck],0)
+                #print(tck,tcp,':',tv)
+                if tv: # force conversion with UTC TZ
+                    ts = tv.replace(tzinfo=datetime.timezone.utc).timestamp()
+                    #print(f"CHECKING {tck} of {ts} against:",tcp)
+                    if 'after' in tcp:
+                        if ts <= tcp['after']: return True # too old
+                    if 'before' in tcp:
+                        if ts > tcp['before']: return True # too new
+            return False # it's a keeper
+        
+        if timeFilter(node,tconSet): continue # reject
+            
+        # extract some attributes
+        cs = str(node.color)
+        if cs not in colorSum: colorSum[cs] = 0
+        colorSum[cs] += 1
+        flags = []
+        for f in ['archived','pinned','trashed','deleted']:
+            av = getattr(node,f,None)
+            if av != None:
+                if av:
+                    #print(f"Observe {f} as {av}")
+                    flags.append(f'{f}:{av}')
+                    if f not in flagk: flagk[f] = 0
+                    flagk[f] += 1
+        labels = []
+        if len(node.labels) > 0:
+            labels = [l.name for l in node.labels.all()]
+        tallyLabels(labels)
+        selectedk += 1
+
+        eAction(node,flags,cs,labels) # The main action (only 1 now)
+
+        if extractp is not None: extractOne(node)
+        #else:
+        #   print("NO EXTRACT")
+
+        # Action items to apply to nodes:
+        if tags:
+            for t in tags:
+                node.labels.add(t)
+
+        if untags is not None:
+            if len(untags) == 0:
+                tags2go = node.labels.all()
+                #print("Remove all labels: "+str(tags2go))
+                for u in tags2go:
+                    node.labels.remove(u)
+            else:
+                for u in untags:
+                    node.labels.remove(u)
+
+        if setColor:
+            node.color = setColor
+
+        #print("passapp:",passapp)
+        if passapp != None:
+            #print("passapp:",passapp)
+            node.pinned = passapp
+
+        if revivep:
+            node.trashed = False
+            node.archived = False
+
+        if archivep:
+            node.archived = True
+
+        if trashp:
+            node.trashed = True
+
+        if execp: # exclude archive - it goes there upon completion
+            import subprocess, shlex
+            resultTag = 'result'
+            #if len(execp) > 0: resultTag = execp[0]
+            node.archived = True
+            print("EXEC:",node.title)
+            args = shlex.split(node.title)
+            cp = subprocess.run(args,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+            print(cp.stdout)
+            newNote = keep.createNote('Result of '+node.title,cp.stdout)
+            newNote.pinned = True
+            newNote.color = gkeepapi.node.ColorValue.Blue
+            reslabel = keep.findLabel(resultTag,create=True)
+            newNote.labels.add(reslabel)
+
+    if extractp is not None: # Create all label links
+        linkExtracts()
+        xlogf.close()
+
+    #print('scolors:',scolors)
+    out("SUMMARY OF SELECTIONS ==================",g=5)
+    out("Notes selected:"+str(selectedk),g=5)
+    out("Color counts:",g=5)
+    for c,s in colorSum.items():
+        out("%40s: %4d" % (c,s),g=5)
+    #print("slabels:",slabels)
+    ld = "not used"
+    if slabels != None:
+        ld = [l.name for l in slabels]
+        if len(slabels) == 0: ld = 'unlabeled only'
+    out(f"Label counts (required labels: {ld}):",g=5)
+    for l,s in sorted(labelSum.items()):
+        out("%40s: %4d" % (l,s),g=5)
+    if len(flagk.keys()) == 0:
+        out("No flagged notes",g=5)
+    else:
+        out("Flag counts:",g=5)
+        for f,k in flagk.items():
+            out("%40s: %4d" % (f,k),g=5)
+    for tck,tcp in tconSet.items():
+        out(f'{tck} time filter:',g=5)
+        for fk,fv in tcp.items():
+            out(f'  {fk}:'+datetime.datetime.utcfromtimestamp(fv).
+                  strftime('%Y-%m-%d %H:%M:%S'),g=5)
+
+def note (noteLines,labels): # Add a note to the collection
+    nnText = '\n'.join(noteLines[1:])
+    newNote = keep.createNote(noteLines[0], nnText)
+    newNote.pinned = True
+    newNote.color = gkeepapi.node.ColorValue.Blue
+    if labels:
+        for labelText in labels:
+            label = keep.findLabel(labelText,create=True)
+            newNote.labels.add(label)
+    keep.sync()
+
+######################################################################
+# Main:
+    
+validActions = [ "note", "select" ]
+# register a resource
+# define a tag
+def action (argv):
+    if argv not in validActions:
+        raise ValueError("Valid actions are: "+"|".join(validActions))
+    return argv
+
+p = argparse.ArgumentParser(
+    description='select from, or modify or add to Google Keep notes',
+    epilog='Try: "keep -select -h" and "keep -h select"'
+)
+
+p.add_argument("--pickle", action="store_true", default=False,
+               help="Save raw info from 3rd party load sources")
+p.add_argument("--unpickle", action="store_true", default=False,
+               help="Load raw info from 3rd party load sources instead of remote fetch")
+
+subp = p.add_subparsers(dest='action',
+                        help="action - "+'|'.join(validActions))
+nP = subp.add_parser(name='note',help='add a new note')
+sP = subp.add_parser(name='select',help='select notes for operations or listing')
+
+# Selection control
+sP.add_argument("-xp","--nopinned", action="store_true", default=False,
+               help="Exclude pinned notes")
+sP.add_argument("-po","--onlypinned", action="store_true", default=False,
+               help="Select only pinned notes")
+sP.add_argument("-T","--trashed", action="store_true", default=False,
+               help="Search Trash instead of active notes")
+sP.add_argument("-A","--archived", action="store_true", default=False,
+               help="Search Archive instead of active notes")
+sP.add_argument("-c","--colors", nargs='*',
+               help="Restrict selection to only these colors")
+sP.add_argument("-l","--labels", nargs='*',
+               help="Each selection must have all these labels. Null list to selected unlabeled only, omit to ignore labelling.")
+sP.add_argument("-m","--match",
+               help="String for text match")
+sP.add_argument("-r","--re",
+               help="Regular expression for text match")
+# Time selection
+sP.add_argument("-ct","--ctime", nargs='*',
+               help="created time restriction")
+sP.add_argument("-ut","--utime", nargs='*',
+               help="updated time restriction")
+sP.add_argument("-et","--etime", nargs='*',
+               help="edited time restriction")
+sP.add_argument("-at","--atime", nargs='*',
+               help="archived time restriction")
+sP.add_argument("-tt","--ttime", nargs='*',
+               help="trashed time restriction")
+sP.add_argument("-dt","--dtime", nargs='*',
+               help="deleted time restriction")
+
+#### Attributes setting
+# common to select (modify) and note (new)
+p.add_argument("--tag", nargs='*',
+               help="Add label(s) to selected notes")
+p.add_argument("--untag", nargs='*',
+               help="Remove label(s) from selected notes")
+p.add_argument("--color",
+               help="New color for matched notes")
+p.add_argument("--pin", action="store_true", default=False,
+               help="Set matched notes to pinned")
+p.add_argument("--unpin", action="store_true", default=False,
+               help="Set matched notes to unpinned")
+
+# select (modify) only
+sP.add_argument("--revive", action="store_true", default=False,
+               help="Move notes from archive or Trash to active")
+sP.add_argument("--archive", action="store_true", default=False,
+               help="Move notes to Archive")
+sP.add_argument("--trash", action="store_true", default=False,
+               help="Move notes to Trash")
+# Danger zone - feed to shell
+sP.add_argument("--exec", action="store_true", default=False,
+               help="Feed the text portion through a shell")
+# transfer notes
+sP.add_argument("--extract", nargs='*',
+               help="Copy selections to directory tree")
+
+# New note
+nP.add_argument("--text", nargs='*',
+               help="Add new note")
+nP.add_argument("-l","--labels", nargs='*',
+               help="New note will have all these labels.")
+# universal options
+# Reporting TBD
+p.add_argument("-v","--verbosity",type=int,default=10,
+               help="Reporting level during selection or addition")
+
+args = p.parse_args()
+verbosity = args.verbosity
+
+cfgpath = os.path.join(os.environ['HOME'],'google.ini')
+try:
+    with open(cfgpath) as fp:
+        out(f'Using config at {cfgpath}',g=10)
+        fp.close()
+except IOError:
+    print("\nCould not read configuraton file at",cfgpath)
+    print("Please create such a file with content similar to:")
+    print()
+    print("# START OF SAMPLE AFTER THIS LINE")
+    print(
+f"""[keep]
+cachedir = {os.path.join(os.environ['HOME'],'keep')}
+cachefile = keep.pickle
+keepID = MYID@gmail.com
+keepAPW = MY-APP-PASSWORD"""
+    )
+    print("# END OF SAMPLE BEFORE THIS LINE")
+    print()
+    print("Generate an app password using instructions here:\n  https://support.google.com/accounts/answer/185833?hl=en")
+    print()
+    print(f"Also do:\n  chmod 600 {cfgpath}")
+    print()
+    print("for more info see:\n  https://gkeepapi.readthedocs.io/en/latest/#logging-in")
+    print()
+    sys.exit(2)
+
+if not args.action:
+    print("No action specified")
+    sys.exit(0)
+
+from goopy.keep import KeepSession
+# This discards Session handle, but holds client so sess stays instantiated
+    
+with KeepSession(unpickle=args.unpickle) as ksession:
+    keep = ksession.getClient()
+
+    #auth = gkeepapi.API.getAuth(keep)
+    #email = auth.getEmail()
+    #print("Email:",email)
+    #print("MT:",mtok)
+
+    if args.action == 'select':
+        tkeys = ['ctime','utime','etime','atime','ttime','dtime']
+        tp = dict([(tpk,getattr(args,tpk,None)) for tpk in tkeys])
+        select(matchp=args.match,rematchp=args.re,labelsp=args.labels,
+               colorsp=args.colors,
+               addTagsp=args.tag,delTagsp=args.untag,
+               timesp=tp,
+               pinnedp=(args.nopinned,args.onlypinned),
+               trashedp=args.trashed,
+               archivedp=args.archived,
+               pinp = (args.pin,args.unpin),
+               newColor=args.color,
+               trashp=args.trash,
+               archivep=args.archive,
+               revivep=args.revive,
+               execp=args.exec,
+               extractp=args.extract,
+               eAction=eList)
+    if args.action == 'note':
+        note(args.text,args.labels)
+#   if args.trash:
+#       trash(args.select,args.labels)
+#   summary()
+
