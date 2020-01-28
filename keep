@@ -429,6 +429,18 @@ def select (matchp=None,rematchp=None,
         
         if timeFilter(node,tconSet): continue # reject
             
+        labels = []
+        if len(node.labels) > 0:
+            labels = [l.name for l in node.labels.all()]
+
+        reject = False
+        if labelsp: # selection filtering by labels
+            lslabels = list(labelsp)
+            for sl in lslabels: # all must be present
+                if sl not in labels: # missing at least one
+                    reject = True; break
+        if reject: continue # missing a required label
+            
         # extract some attributes
         cs = str(node.color)
         if cs not in colorSum: colorSum[cs] = 0
@@ -442,9 +454,6 @@ def select (matchp=None,rematchp=None,
                     flags.append(f'{f}:{av}')
                     if f not in flagk: flagk[f] = 0
                     flagk[f] += 1
-        labels = []
-        if len(node.labels) > 0:
-            labels = [l.name for l in node.labels.all()]
         tallyLabels(labels)
         selectedk += 1
 
