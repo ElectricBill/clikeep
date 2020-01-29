@@ -1,7 +1,11 @@
 ## Installation Notes
-The keep Python3 script will require at least these modules:
+The keep Python3 script will require at least the following modules.  Three are packaged at pipy.org and may be installed system-wide or via your preferred method, for example:
 
 'pip3 install gkeepapi gpsoauth dateparser`
+
+The goopy repository should be placed somewhere within PYTHONPATH:
+
+`git clone git@github.com:ElectricBill/goopy`
 
 ### Configuration
 The program requires login credentials to access your Google Keep notes. It will display instructions for obtaining and credentials and setting up the configuration file when first run with no arguments.
