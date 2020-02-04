@@ -613,10 +613,6 @@ sP.add_argument("-dt","--dtime", nargs='*',
 
 #### Attributes setting
 # common to select (modify) and note (new)
-p.add_argument("--tag", nargs='*',
-               help="Add label(s) to selected notes")
-p.add_argument("--untag", nargs='*',
-               help="Remove label(s) from selected notes")
 p.add_argument("--color",
                help="New color for matched notes")
 p.add_argument("--pin", action="store_true", default=False,
@@ -625,6 +621,10 @@ p.add_argument("--unpin", action="store_true", default=False,
                help="Set matched notes to unpinned")
 
 # select (modify) only
+sP.add_argument("--tag", nargs='*',
+               help="Add label(s) to selected notes")
+sP.add_argument("--untag", nargs='*',
+               help="Remove label(s) from selected notes")
 sP.add_argument("--revive", action="store_true", default=False,
                help="Move notes from archive or Trash to active")
 sP.add_argument("--archive", action="store_true", default=False,
